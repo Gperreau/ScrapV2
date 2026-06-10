@@ -183,7 +183,8 @@ PERIN_KW = [
     "preparer sa retraite", "preparer votre retraite",
     "retraite supplémentaire", "retraite complementaire",
     "sortie en rente", "sortie en capital",
-    "placement retraite", "patrimoine",
+    "placement retraite",
+    # Pas "patrimoine" seul → trop générique, cause faux positifs SIRENE
 ]
 
 
@@ -391,12 +392,10 @@ def ddg_search(query: str, max_results: int = 8, delay: float = DDG_DELAY) -> li
 
 
 def _is_excluded(url: str) -> bool:
-    """True si le domaine est dans la liste des domaines toujours exclus."""
     return any(e in url for e in EXCLUDED_ALWAYS)
 
 
 def _is_secondary(url: str) -> str | None:
-    """Retourne le label de la source secondaire si l'URL en est une, sinon None."""
     for domain, label in SECONDARY_SOURCES.items():
         if domain in url:
             return label
@@ -404,127 +403,337 @@ def _is_secondary(url: str) -> str | None:
 
 
 def _is_insurance_relevant(url: str, snippet: str) -> bool:
-    """
-    Vérifie qu'un résultat DDG est pertinent pour un courtier d'assurance.
-    On accepte si l'URL ou le snippet contient au moins un mot-clé assurance.
-    """
     combined = (url + " " + snippet).lower()
     return any(kw in combined for kw in INSURANCE_RELEVANCE_KW)
 
 
-def find_url_ddg(
-    nom: str, siren: str, delay: float = DDG_DELAY
+# ═══════════════════════════════════════════════════════════
+#  DÉCOUVERTE D'URL — SANS DDG (fiable sur GitHub Actions)
+#  DDG est bloqué sur les IPs AWS/GitHub → on l'utilise en
+#  dernier recours uniquement.
+#  Pipeline :
+#    1. SIRENE   → URL enregistrée à l'INSEE  (~30%)
+#    2. Annuaire → extrait URL de la fiche publique
+#    3. Pappers  → description + URL parfois
+#    4. Domain probing → variantes systématiques
+#    5. DDG      → optionnel, si les 4 premières échouent
+# ═══════════════════════════════════════════════════════════
+
+import unicodedata
+
+
+def _to_slug(text: str) -> str:
+    nfd = unicodedata.normalize("NFD", text)
+    asc = "".join(c for c in nfd if unicodedata.category(c) != "Mn")
+    return re.sub(r"[^a-z0-9]+", "-", asc.lower()).strip("-")
+
+
+def _clean_nom_for_domain(nom: str) -> str:
+    """Retire la forme juridique et les termes très génériques."""
+    cleaned = re.sub(
+        r'\b(s\.?a\.?s\.?|s\.?a\.?r\.?l\.?|s\.?n\.?c\.?|s\.?a\.?|'
+        r'eurl|sci|scp|snc|sarl|sas|sa|sela|selarl|'
+        r'assurances?|courtage|conseil|consulting|services?|partenaires?|groupe|group)\b',
+        ' ', nom, flags=re.IGNORECASE
+    ).strip()
+    return re.sub(r'\s+', ' ', cleaned).strip()
+
+
+def generate_domain_candidates(nom: str, ville: str = "") -> list[str]:
+    """Génère jusqu'à 25 variantes de domaine probables."""
+    clean = _clean_nom_for_domain(nom)
+    words = [w for w in clean.split() if len(w) > 2]
+    slug  = _to_slug(clean)
+    slug_c = slug.replace("-", "")
+
+    candidates = []
+
+    # Nom complet
+    for ext in [".fr", ".com"]:
+        candidates += [
+            f"https://www.{slug}{ext}",
+            f"https://{slug}{ext}",
+            f"https://www.{slug_c}.fr",
+        ]
+
+    # Avec préfixes
+    for pref in ["cabinet", "agence"]:
+        candidates += [
+            f"https://www.{pref}-{slug}.fr",
+            f"https://{pref}-{slug}.fr",
+        ]
+
+    # Avec suffixes
+    for suf in ["assurance", "assurances", "courtage"]:
+        candidates += [
+            f"https://www.{slug}-{suf}.fr",
+            f"https://www.{slug_c}{suf}.fr",
+        ]
+
+    # Mots individuels (prénom/nom du dirigeant souvent dans le nom du cabinet)
+    for w in words[:3]:
+        s = _to_slug(w)
+        if len(s) > 4:
+            candidates += [
+                f"https://www.{s}-assurance.fr",
+                f"https://www.{s}-assurances.fr",
+                f"https://www.cabinet-{s}.fr",
+                f"https://www.{s}.fr",
+            ]
+
+    # Dédupliquer
+    seen: set = set()
+    out = []
+    for c in candidates:
+        if c not in seen:
+            seen.add(c)
+            out.append(c)
+    return out[:25]
+
+
+def probe_domains(candidates: list[str], timeout: int = 4) -> str:
+    """HEAD request sur chaque candidat. Retourne la première URL qui répond."""
+    for url in candidates:
+        try:
+            r = requests.head(url, headers=HEADERS, timeout=timeout, allow_redirects=True)
+            # 403 = Cloudflare/anti-bot mais le site existe
+            if r.status_code in (200, 301, 302, 403):
+                return r.url
+        except Exception:
+            continue
+    return ""
+
+
+def scrape_pappers(siren: str) -> str:
+    """Scrappe la fiche Pappers.fr (accessible, contient la description d'activité)."""
+    s9 = re.sub(r"[\s\-\.]", "", siren)[:9]
+    return scrape_url_sync(f"https://www.pappers.fr/entreprise/{s9}") or ""
+
+
+def scrape_annuaire_page(siren: str) -> tuple[str, str]:
+    """
+    Scrappe la fiche Annuaire des entreprises (data.gouv.fr).
+    Retourne (texte_page, url_site_trouvée).
+    """
+    s9 = re.sub(r"[\s\-\.]", "", siren)[:9]
+    try:
+        r = requests.get(
+            f"https://annuaire-entreprises.data.gouv.fr/entreprise/{s9}",
+            headers=HEADERS, timeout=12, allow_redirects=True,
+        )
+        if r.status_code != 200:
+            return "", ""
+        soup = BeautifulSoup(r.content, "lxml")
+
+        # Chercher une URL de site dans la page
+        site_url = ""
+        for a in soup.find_all("a", href=True):
+            href = a["href"]
+            if href.startswith("http") and not any(e in href for e in EXCLUDED_ALWAYS):
+                label = a.get_text(strip=True).lower()
+                if any(kw in label for kw in ["site", "web", "www"]):
+                    site_url = href
+                    break
+        if not site_url:
+            # Chercher dans le texte brut
+            text_raw = soup.get_text()
+            m = re.search(r'https?://(?!annuaire|data\.gouv|sirene)[^\s<>"\']{4,}', text_raw)
+            if m:
+                candidate = m.group(0).rstrip("/.,)\"'")
+                if not any(e in candidate for e in EXCLUDED_ALWAYS):
+                    site_url = candidate
+
+        for tag in soup(["script","style","nav","footer","head","noscript"]):
+            tag.decompose()
+        return soup.get_text(separator=" ", strip=True).lower(), site_url
+    except Exception:
+        return "", ""
+
+
+
+# ═══════════════════════════════════════════════════════════
+#  RÉSEAUX D'AGENTS GÉNÉRAUX
+#  Pour les agents liés à une compagnie, cherche leur page
+#  dédiée sur le site localisateur de l'assureur.
+# ═══════════════════════════════════════════════════════════
+
+INSURER_NETWORKS = {
+    # Mot-clé dans le nom SIRENE → (domaine localisateur, slug de recherche)
+    "groupama":   "agences.groupama.fr",
+    "gan":        "agence.gan.fr",
+    "axa":        "agences.axa.fr",
+    "allianz":    "agences.allianz.fr",
+    "mma":        "agence.mma.fr",
+    "generali":   "agences.generali.fr",
+    "abeille":    "agences.abeille-assurances.fr",
+    "aviva":      "agences.abeille-assurances.fr",   # Aviva → Abeille
+    "swisslife":  "agences.swisslife.fr",
+    "swiss life": "agences.swisslife.fr",
+    "maif":       "www.maif.fr",
+    "macif":      "www.macif.fr",
+    "maaf":       "www.maaf.fr",
+    "thelem":     "www.thelem-assurances.fr",
+    "areas":      "agences.areas.fr",
+    "matmut":     "www.matmut.fr",
+    "gmf":        "www.gmf.fr",
+    "april":      "www.april.fr",
+}
+
+# Domaines exclus de la recherche de site indépendant
+# (appartiennent à un réseau d'assureurs, pas au courtier lui-même)
+INSURER_DOMAINS = set(INSURER_NETWORKS.values())
+
+
+def detect_insurer(nom: str) -> str | None:
+    """
+    Détecte le réseau d'assureur depuis le nom SIRENE.
+    Ex: 'AGENCE GAN ASSURANCES DUPONT JEAN' → 'gan'
+    """
+    nom_l = nom.lower()
+    for keyword in INSURER_NETWORKS:
+        if keyword in nom_l:
+            return keyword
+    return None
+
+
+def find_insurer_agent_page(
+    nom: str, siren: str, insurer_key: str
+) -> tuple[str, str]:
+    """
+    Cherche la page dédiée de l'agent sur le site localisateur
+    de l'assureur (agence.gan.fr, agences.axa.fr…).
+
+    Stratégie :
+    1. Tentative de construction d'URL à partir du slug du nom
+    2. Scraping de la page de recherche du localisateur
+    3. HEAD request sur les variantes de slug connues
+
+    Retourne (url, méthode).
+    """
+    domain  = INSURER_NETWORKS.get(insurer_key, "")
+    if not domain:
+        return "", ""
+
+    # Nom nettoyé : retirer le nom de la compagnie et la forme juridique
+    clean = re.sub(
+        rf'\b{re.escape(insurer_key)}\b', '', nom, flags=re.IGNORECASE
+    )
+    clean = _clean_nom_for_domain(clean)
+    slug  = _to_slug(clean)
+    slug_parts = slug.split("-")
+
+    # ── Variantes de slug à essayer ────────────────────────
+    slug_candidates = [slug]
+    # Variantes avec tirets / sans tirets
+    if len(slug_parts) >= 2:
+        slug_candidates += [
+            "-".join(slug_parts),
+            "".join(slug_parts),
+            "-".join(reversed(slug_parts)),   # prénom-nom / nom-prénom
+        ]
+    # Avec préfixes communs dans ces réseaux
+    for p in ["cabinet", "agence"]:
+        slug_candidates.append(f"{p}-{slug}")
+
+    # ── Patterns d'URL selon l'assureur ───────────────────
+    url_patterns = []
+    base = f"https://www.{domain}"
+
+    for s in dict.fromkeys(slug_candidates):   # dédupliqué
+        if not s:
+            continue
+        if insurer_key in ("gan", "groupama"):
+            url_patterns += [
+                f"{base}/{s}",
+                f"https://{domain}/{s}",
+            ]
+        elif insurer_key in ("axa", "allianz", "mma", "generali",
+                             "abeille", "aviva", "swisslife", "areas"):
+            url_patterns += [
+                f"{base}/{s}/",
+                f"{base}/{s}",
+                f"https://{domain}/{s}",
+            ]
+        else:
+            url_patterns += [
+                f"{base}/agence/{s}",
+                f"{base}/conseiller/{s}",
+                f"{base}/{s}",
+            ]
+
+    # ── HEAD request sur chaque variante ──────────────────
+    found = probe_domains(url_patterns, timeout=5)
+    if found:
+        return found, f"Réseau {insurer_key.upper()}"
+
+    return "", ""
+
+
+def find_url_for_entry(
+    nom: str, siren: str, ville: str, sirene_url: str,
+    delay: float = DDG_DELAY,
 ) -> tuple[str, str, dict]:
     """
-    Cherche l'URL officielle du cabinet + snippets des sources secondaires.
+    Découverte d'URL complète pour un courtier ou agent général.
+    Retourne (url, méthode, textes_sources_secondaires).
 
-    Retourne (url_principale, méthode, sources_secondaires)
-    où sources_secondaires = {"LinkedIn": "texte...", "PagesJaunes": "texte..."}
-
-    Stratégie pour l'URL principale (sources secondaires exclues) :
-      1. Nom complet + "courtier assurance"
-      2. Nom complet + "assurance"
-      3. Nom simplifié + "assurance courtier"
-      4. SIREN + nom (dernier recours)
-
-    Stratégie pour les sources secondaires (recherches dédiées) :
-      - LinkedIn : site:linkedin.com/company + nom
-      - PagesJaunes : site:pagesjaunes.fr + nom
-    """
-def find_url_ddg(
-    nom: str, siren: str, delay: float = DDG_DELAY
-) -> tuple[str, str, dict]:
-    """
-    UNE seule requête DDG large (12 résultats) qui fait tout :
-      - trouve l'URL principale (premier résultat non-exclu, non-secondaire)
-      - collecte les snippets LinkedIn et PagesJaunes au passage
-      - collecte TOUS les snippets pour enrichir la détection
-
-    Seulement si rien trouvé → 1 requête de repli avec SIREN.
-    Total : 1-2 requêtes DDG par courtier (au lieu de 5-9 avant).
-
-    L'URL principale est acceptée dès qu'elle n'est pas exclue —
-    on ne filtre PAS par mots-clés assurance dans le snippet
-    (un courtier peut avoir un snippet neutre "Bienvenue chez nous").
+    1. SIRENE URL directe (si domaine indépendant)
+    2. Réseau assureur  (si agent général détecté dans le nom)
+    3. Annuaire entreprises (URL + texte)
+    4. Pappers.fr (texte riche)
+    5. Domain probing (domaine propre)
+    6. DDG en dernier recours (optionnel)
     """
     secondary: dict[str, str] = {}
-    all_snippets_text = ""
+    url, method = "", ""
 
-    if not nom and not siren:
-        return "", "Non trouvé", secondary
+    # ── 1. URL directe SIRENE (domaine indépendant uniquement) ──
+    if sirene_url and not any(d in sirene_url for d in INSURER_DOMAINS):
+        url, method = sirene_url, "SIRENE direct"
 
-    nom_clean = re.sub(
-        r'\b(s\.?a\.?s\.?|s\.?a\.?r\.?l\.?|s\.?a\.?|eurl|sci|scp|snc|'
-        r'société|cabinet|agence|sarl|sas|sa)\b',
-        '', nom, flags=re.IGNORECASE
-    ).strip(" -.,")
+    # ── 2. Page réseau assureur (agent général) ───────────────
+    if not url and nom:
+        insurer = detect_insurer(nom)
+        if insurer:
+            ins_url, ins_method = find_insurer_agent_page(nom, siren, insurer)
+            if ins_url:
+                url, method = ins_url, ins_method
 
-    primary_url = ""
-    primary_method = ""
+    # ── 3. Annuaire entreprises ──────────────────────────────
+    ann_text, ann_url = scrape_annuaire_page(siren)
+    if ann_text:
+        secondary["Annuaire"] = ann_text
+    if ann_url and not url:
+        if not any(d in ann_url for d in INSURER_DOMAINS):
+            url, method = ann_url, "Annuaire entreprises"
 
-    # ── Requêtes dans l'ordre de précision décroissante ───────
-    # 1. Nom simplifié (sans forme juridique) + assurance  → le plus efficace
-    # 2. Nom complet entre guillemets + assurance           → si nom court/unique
-    # 3. Repli SIREN + assurance (uniquement si nom connu)
-    queries = []
-    if nom_clean:
-        queries.append((f'{nom_clean} assurance', f'DDG: {nom_clean}'))
-    if nom:
-        queries.append((f'"{nom}" assurance', f'DDG: "{nom}"'))
-    if siren and nom:
-        queries.append((f'{siren} {nom_clean or nom} assurance', f'DDG: SIREN+nom'))
+    # ── 4. Pappers.fr ────────────────────────────────────────
+    pap_text = scrape_pappers(siren)
+    if pap_text:
+        secondary["Pappers"] = pap_text
 
-    for query, method in queries:
-        results = ddg_search(query, max_results=12, delay=delay)
+    # ── 5. Domain probing (domaine indépendant) ───────────────
+    if not url and nom:
+        candidates = generate_domain_candidates(nom, ville)
+        probed = probe_domains(candidates)
+        if probed:
+            url, method = probed, "Domain probing"
 
+    # ── 6. DDG — dernier recours ─────────────────────────────
+    if not url and nom and HAS_DDG:
+        nom_slug = _clean_nom_for_domain(nom)
+        results  = ddg_search(f"{nom_slug} assurance", max_results=8, delay=delay)
         for r in results:
-            url     = r.get("href", "")
+            href    = r.get("href", "")
             snippet = r.get("body", "")
-            all_snippets_text += " " + snippet
+            secondary.setdefault("DDG snippets", "")
+            secondary["DDG snippets"] += " " + snippet
+            if href and not _is_excluded(href) and not _is_secondary(href):
+                if _is_insurance_relevant(href, snippet):
+                    url, method = href, "DDG (dernier recours)"
+                    break
 
-            if not url:
-                continue
-            if _is_excluded(url):
-                continue
-            sec_label = _is_secondary(url)
-            if sec_label:
-                if sec_label not in secondary:
-                    secondary[sec_label] = snippet
-                continue
-            if not primary_url:
-                primary_url    = url
-                primary_method = method
-
-        if primary_url:
-            break   # on a trouvé → inutile de continuer
-
-    # ── Repli SIREN si toujours rien ──────────────────────────
-    if not primary_url and siren:
-        results3 = ddg_search(
-            f'{siren} assurance', max_results=6, delay=delay
-        )
-        for r in results3:
-            url     = r.get("href", "")
-            snippet = r.get("body", "")
-            all_snippets_text += " " + snippet
-            if not url or _is_excluded(url):
-                continue
-            sec_label = _is_secondary(url)
-            if sec_label:
-                if sec_label not in secondary:
-                    secondary[sec_label] = snippet
-                continue
-            # Pour le repli SIREN : exiger au moins 1 mot-clé assurance
-            if _is_insurance_relevant(url, snippet):
-                primary_url    = url
-                primary_method = "DDG: SIREN (repli)"
-                break
-
-    # Stocker tous les snippets comme source "DDG snippets"
-    if all_snippets_text.strip():
-        secondary["DDG snippets"] = all_snippets_text.lower()
-
-    return primary_url, primary_method, secondary
+    return url, method, secondary
 
 
 def scrape_url_sync(url: str) -> str:
@@ -733,23 +942,28 @@ async def process_chunk(
         cache[r["orias"]] = result
         results.append(result)
 
-    # ── Phase 3 : DDG pour les entrées sans URL ───────────
+    # ── Phase 3 : Découverte d'URL (Annuaire + Pappers + Domain probing) ──
     if without_url:
-        print(f"\n  Phase 3 — DDG ({nb_ddg} entrées)…")
+        print(f"\n  Phase 3 — Découverte URL ({nb_ddg} entrées) — Annuaire/Pappers/Probing…")
         counter = [0]
-        bar     = tqdm(total=nb_ddg, desc="DDG search", unit="entrée", ncols=80) if HAS_TQDM else None
+        bar     = tqdm(total=nb_ddg, desc="Découverte URL", unit="entrée", ncols=80) if HAS_TQDM else None
 
-        def ddg_task(item):
+        def url_task(item):
             r, sd = item
             nom   = sd.get("nom") or r.get("nom", "")
-            url, method, secondary = find_url_ddg(nom, r["siren"], delay)
+            ville = sd.get("ville", "")
+
+            url, method, secondary = find_url_for_entry(
+                nom, r["siren"], ville, sd.get("url",""), delay
+            )
 
             # Scraper le site officiel si URL trouvée
             text = ""
             if url:
                 text = scrape_url_sync(url)
                 if len(text) < 300:
-                    for suf in ["/nos-offres", "/produits", "/services"]:
+                    for suf in ["/nos-offres", "/produits", "/services",
+                                "/assurances", "/particuliers", "/garanties"]:
                         t2 = scrape_url_sync(url.rstrip("/") + suf)
                         if len(t2) > len(text):
                             text = t2
@@ -760,17 +974,18 @@ async def process_chunk(
             if bar:
                 bar.update(1)
             elif counter[0] % 50 == 0:
-                print(f"    [{counter[0]}/{nb_ddg}]")
+                nb_ok = sum(1 for res in results if res.get("url"))
+                print(f"    [{counter[0]}/{nb_ddg}] URLs trouvées : {nb_ok}")
 
             return r["orias"], result
 
-        # Exécuter DDG dans un ThreadPoolExecutor (I/O-bound, limité par rate limit)
+        # Parallélisme plus élevé : sans DDG, pas de rate-limit global
         loop   = asyncio.get_event_loop()
-        chunks = [without_url[i:i+100] for i in range(0, len(without_url), 100)]
+        chunks = [without_url[i:i+200] for i in range(0, len(without_url), 200)]
 
         for chunk in chunks:
-            with ThreadPoolExecutor(max_workers=min(workers, 3)) as executor:
-                tasks = [loop.run_in_executor(executor, ddg_task, item) for item in chunk]
+            with ThreadPoolExecutor(max_workers=min(workers, 10)) as executor:
+                tasks = [loop.run_in_executor(executor, url_task, item) for item in chunk]
                 done  = await asyncio.gather(*tasks, return_exceptions=True)
 
             for res in done:
@@ -779,7 +994,6 @@ async def process_chunk(
                     cache[orias_id] = result
                     results.append(result)
 
-            # Sauvegarde intermédiaire après chaque tranche de 100
             _save_cache(cache, cache_path)
 
         if bar:
@@ -839,7 +1053,7 @@ def load_input(
 ) -> list[dict]:
     """
     Charge le fichier et retourne uniquement le bloc (chunk) de cette instance.
-    chunk_id  : 1-based (1, 2, … total_chunks)
+    chunk_id  : 1-based (1, 2, ... total_chunks)
     total_chunks : nombre total de blocs (pour GitHub Actions matrix)
     """
     p = Path(path)
